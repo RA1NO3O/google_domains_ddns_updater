@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:window_manager/window_manager.dart';
 
 enum IPSourceType {
   unspecified,
@@ -24,7 +27,10 @@ enum IPSourceType {
 }
 
 void main() {
-  runApp(const MyApp());
+  WidgetsFlutterBinding.ensureInitialized();
+  windowManager.ensureInitialized().then((value) => runApp(const MyApp()));
+  windowManager.waitUntilReadyToShow(
+      const WindowOptions(size: Size(450, 700)), () {});
 }
 
 class MyApp extends StatelessWidget {
@@ -49,31 +55,41 @@ class MyHomePage extends StatefulWidget {
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
+class _MyHomePageState extends State<MyHomePage> with WindowListener {
   late final SharedPreferences pref;
   String result = '';
   bool _isProcessing = false;
   bool _saveInfo = false;
   bool _expandExtraSettings = false;
+  final ValueNotifier<bool> _autoExec = ValueNotifier(false);
   final _usernameField = TextEditingController();
   final _passwordField = TextEditingController();
   final _hostnameField = TextEditingController();
   final _specifiedIPField = TextEditingController();
   final _customIFConfigDomainField = TextEditingController();
+  final _autoExecDurationField = TextEditingController();
+  late Timer _autoExecTimer;
 
   IPSourceType _ipSourceType = IPSourceType.unspecified;
 
   @override
   void initState() {
+    windowManager.addListener(this);
     SharedPreferences.getInstance().then((value) {
       pref = value;
-      _saveInfo = pref.getBool('save_info') ?? false;
+      WidgetsBinding.instance.addPostFrameCallback((_) => setState(() {
+            _saveInfo = pref.getBool('save_info') ?? false;
+            _autoExec.value = pref.getBool('auto_exec') ?? false;
+            if (_autoExec.value) activeAutoExecTimer();
+          }));
       _usernameField.text = pref.getString('saved_username') ?? '';
       _passwordField.text = pref.getString('saved_password') ?? '';
       _hostnameField.text = pref.getString('saved_hostname') ?? '';
       _customIFConfigDomainField.text =
           pref.getString('saved_customIFConfigDomain') ?? '';
       _specifiedIPField.text = pref.getString('saved_specifiedIP') ?? '';
+      _autoExecDurationField.text =
+          (pref.getInt('auto_exec_duration') ?? 1).toString();
     });
     super.initState();
   }
@@ -98,6 +114,7 @@ class _MyHomePageState extends State<MyHomePage> {
                   TextField(
                     enabled: !_isProcessing,
                     controller: _passwordField,
+                    obscureText: true,
                     decoration: const InputDecoration(labelText: '密码*'),
                   ),
                   TextField(
@@ -155,8 +172,8 @@ class _MyHomePageState extends State<MyHomePage> {
                                         enabled: !_isProcessing,
                                         controller: _specifiedIPField,
                                         decoration: const InputDecoration(
-                                            labelText: 'IPV4地址',
-                                            hintText: '1.2.3.4'))
+                                            labelText: 'IPV4/6地址',
+                                            hintText: '1.2.3.4/'))
                                     : _ipSourceType ==
                                             IPSourceType.customService
                                         ? TextField(
@@ -169,7 +186,7 @@ class _MyHomePageState extends State<MyHomePage> {
                                           )
                                         : const Padding(
                                             padding: EdgeInsets.all(8.0),
-                                            child: Text('不指定时，使用发送请求的代理的 IP。'),
+                                            child: Text('不指定时，使用发送请求的 IP。'),
                                           ),
                                 const SizedBox(height: 16),
                                 OutlinedButton.icon(
@@ -196,12 +213,53 @@ class _MyHomePageState extends State<MyHomePage> {
                       label: Text('${_expandExtraSettings ? '隐藏' : '显示'}高级选项')),
                   const SizedBox(height: 8),
                   Text(result),
+                  const SizedBox(height: 8),
+                  ValueListenableBuilder(
+                      valueListenable: _autoExec,
+                      builder: (bc, bool value, Widget? child) => SizedBox(
+                            height: 49,
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.start,
+                              children: [
+                                Checkbox(
+                                    value: value,
+                                    onChanged: _isProcessing
+                                        ? null
+                                        : (_) => autoExecCheckBoxOnChanged()),
+                                const Text('定期自动更新'),
+                                const SizedBox(width: 8),
+                                Visibility(
+                                  visible: value,
+                                  child: Flexible(
+                                    child: TextField(
+                                      enabled: !_isProcessing,
+                                      keyboardType: TextInputType.number,
+                                      controller: _autoExecDurationField,
+                                      decoration: const InputDecoration(
+                                          isDense: true,
+                                          labelText: '更新间隔',
+                                          hintText: '单位:分钟'),
+                                    ),
+                                  ),
+                                )
+                              ],
+                            ),
+                          )),
                 ],
               ),
             ),
           ],
         ),
       );
+
+  autoExecCheckBoxOnChanged() {
+    if (_autoExec.value) {
+      _autoExecTimer.cancel();
+    } else {
+      if (_autoExecDurationField.text != '0') activeAutoExecTimer();
+    }
+    _autoExec.value = !_autoExec.value;
+  }
 
   void _updateClick() {
     setState(() => _isProcessing = true);
@@ -218,34 +276,48 @@ class _MyHomePageState extends State<MyHomePage> {
         setState(() => _isProcessing = false);
       });
     } else {
-      _updateDDNS(_specifiedIPField.text)
-          .then((res) => setState(() {
-                result = res.toString();
-                _isProcessing = false;
-              }))
+      _updateDDNS(_specifiedIPField.text).then((res) => setState(() {
+            result = res.toString();
+            debugPrint(result);
+            _isProcessing = false;
+          }));
+    }
+  }
+
+  Future<Response> _updateDDNS(String ipAddress) async => Dio()
+          .get('https://${_usernameField.text}:${_passwordField.text}'
+              '@domains.google.com/nic/update'
+              '?hostname=${_hostnameField.text}'
+              '${_ipSourceType == IPSourceType.unspecified ? '' : '&myip=$ipAddress'}')
           .catchError((e) {
         debugPrint(e.toString());
         setState(() => _isProcessing = false);
       });
-    }
-  }
-
-  Future<Response> _updateDDNS(String ipAddress) async => Dio().get(
-      'https://${_usernameField.text}:${_passwordField.text}'
-      '@domains.google.com/nic/update'
-      '?hostname=${_hostnameField.text}'
-      '${_ipSourceType == IPSourceType.unspecified ? '' : '&myip=$ipAddress'}');
 
   @override
-  void dispose() {
+  void onWindowClose() {
     if (_saveInfo) {
+      pref.setBool('save_info', _saveInfo);
+      pref.setBool('auto_exec', _autoExec.value);
       pref.setString('saved_username', _usernameField.text);
       pref.setString('saved_password', _passwordField.text);
       pref.setString('saved_hostname', _hostnameField.text);
       pref.setString(
           'saved_customIFConfigDomain', _customIFConfigDomainField.text);
       pref.setString('saved_specifiedIP', _specifiedIPField.text);
+      pref.setInt('auto_exec_duration', int.parse(_autoExecDurationField.text));
     }
+  }
+
+  @override
+  void dispose() {
+    _autoExecTimer.cancel();
+    windowManager.removeListener(this);
     super.dispose();
   }
+
+  void activeAutoExecTimer() => _autoExecTimer = Timer.periodic(
+          Duration(minutes: int.parse(_autoExecDurationField.text)), (timer) {
+        _updateClick();
+      });
 }
