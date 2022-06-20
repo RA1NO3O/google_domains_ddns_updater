@@ -1,6 +1,6 @@
 # google_domains_ddns_updater
 
-A new Flutter project.
+Google域名动态DNS更新器.
 
 ## Getting Started
 
